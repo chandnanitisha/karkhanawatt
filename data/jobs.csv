@@ -1,0 +1,9 @@
+job_id,machine,processing_time,deadline,power_kw,arrival_order,predecessor
+J1,M1,4,40,90,1,
+J2,M2,4,40,85,2,
+J3,M1,3,10,20,3,
+J4,M3,3,40,75,4,
+J5,M2,2,8,15,5,
+J6,M3,2,10,20,6,
+J7,M1,4,40,70,7,
+J8,M2,3,40,65,8,
