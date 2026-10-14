@@ -38,6 +38,8 @@ class SolveResult:
     used_soft_deadlines: bool
     deadline_violations: int
     solver_wall_time: float
+    best_bound: Optional[float] = None
+    optimality_gap: Optional[float] = None
 
 
 def _validate_time_unit(time_unit_minutes: int) -> int:
@@ -99,8 +101,13 @@ def _build_and_solve(
     machine_downtime: Optional[dict] = None,
     job_release_times: Optional[dict] = None,
     time_unit_minutes: int = 60,
+    strategy: str = "cost",
 ) -> SolveResult:
     """Build and solve the scheduling model in the requested time units."""
+    if strategy not in ("cost", "balanced", "time"):
+        raise ValueError(
+            f"Unknown scheduling strategy: '{strategy}'. Supported strategies: 'cost', 'balanced', 'time'."
+        )
     time_unit_minutes = _validate_time_unit(time_unit_minutes)
 
     required = {
@@ -213,8 +220,10 @@ def _build_and_solve(
 
     starts, ends, intervals = {}, {}, {}
     violated = {}
+    tardiness = {}
     cost_terms = []
     max_possible_cost_scaled = 0
+    makespan_var = model.NewIntVar(0, horizon, "makespan")
 
     for job in jobs:
         jid = str(job["job_id"])
@@ -233,7 +242,13 @@ def _build_and_solve(
             raise ValueError(f"Release time for job {jid} cannot be negative.")
         model.Add(start >= release_time)
         model.Add(end == start + p)
+        model.Add(makespan_var >= end)
         interval = model.NewIntervalVar(start, p, end, f"interval_{jid}")
+
+        tard = model.NewIntVar(0, horizon, f"tard_{jid}")
+        model.Add(tard >= end - d)
+        model.Add(tard >= 0)
+        tardiness[jid] = tard
 
         if soft_deadlines:
             is_late = model.NewBoolVar(f"late_{jid}")
@@ -332,12 +347,38 @@ def _build_and_solve(
     )
     model.Add(total_cost_scaled == sum(cost_terms))
 
-    if soft_deadlines:
-        total_violations = sum(violated.values())
-        big_weight = max_possible_cost_scaled + 1
-        model.Minimize(total_violations * big_weight + total_cost_scaled)
+    if not soft_deadlines:
+        if strategy == "time":
+            model.Minimize(makespan_var * 500000 + total_cost_scaled)
+        elif strategy == "balanced":
+            model.Minimize(total_cost_scaled + makespan_var * 5000)
+        else:
+            model.Minimize(total_cost_scaled)
     else:
-        model.Minimize(total_cost_scaled)
+        total_violations = sum(violated.values())
+        total_tardiness = sum(tardiness.values())
+        big_weight = max_possible_cost_scaled + 1
+
+        if strategy == "time":
+            model.Minimize(
+                total_violations * big_weight
+                + total_tardiness * 500000
+                + makespan_var * 250000
+                + total_cost_scaled
+            )
+        elif strategy == "balanced":
+            # In scaled units (COST_SCALE = 1,000,000 = Rs 1.00):
+            # tardiness weight 10,000 corresponds to Rs 0.01 per late minute.
+            # makespan weight 5,000 corresponds to Rs 0.005 per minute makespan.
+            model.Minimize(
+                total_violations * big_weight
+                + total_cost_scaled
+                + total_tardiness * 10000
+                + makespan_var * 5000
+            )
+        else:
+            # Default "cost" strategy preserves exact original formulation
+            model.Minimize(total_violations * big_weight + total_cost_scaled)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit_seconds)
@@ -354,6 +395,8 @@ def _build_and_solve(
             used_soft_deadlines=soft_deadlines,
             deadline_violations=-1,
             solver_wall_time=solver.WallTime(),
+            best_bound=None,
+            optimality_gap=None,
         )
 
     rows = []
@@ -385,6 +428,18 @@ def _build_and_solve(
     makespan = float(schedule["end_time"].max())
     total_cost = solver.Value(total_cost_scaled) / COST_SCALE
 
+    best_bound = None
+    optimality_gap = None
+    try:
+        best_bound = float(solver.BestObjectiveBound())
+        obj_val = float(solver.ObjectiveValue())
+        if obj_val != 0:
+            optimality_gap = round(abs(obj_val - best_bound) / abs(obj_val), 4)
+        else:
+            optimality_gap = 0.0
+    except (RuntimeError, ValueError):
+        pass
+
     return SolveResult(
         schedule=schedule,
         status=status_name,
@@ -393,6 +448,8 @@ def _build_and_solve(
         used_soft_deadlines=soft_deadlines,
         deadline_violations=n_violations,
         solver_wall_time=solver.WallTime(),
+        best_bound=best_bound,
+        optimality_gap=optimality_gap,
     )
 
 
@@ -403,6 +460,7 @@ def solve_schedule(
     machine_downtime: Optional[dict] = None,
     job_release_times: Optional[dict] = None,
     time_unit_minutes: int = 60,
+    strategy: str = "cost",
 ) -> SolveResult:
     """Try strict deadlines first, then retry infeasible/inconclusive runs softly."""
     time_unit_minutes = _validate_time_unit(time_unit_minutes)
@@ -411,6 +469,7 @@ def solve_schedule(
         "machine_downtime": machine_downtime,
         "job_release_times": job_release_times,
         "time_unit_minutes": time_unit_minutes,
+        "strategy": strategy,
     }
 
     strict_result = _build_and_solve(

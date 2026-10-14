@@ -109,14 +109,6 @@ def build_cumulative_table(
 
     return F
 
-    """Build the scaled cumulative tariff table used by OR-Tools CP-SAT."""
-    F = [0]
-    running = 0
-    for t in range(horizon):
-        running += round(hourly_rate(hourly_tariff, t) * TARIFF_SCALE)
-        F.append(running)
-    return F
-
 
 
 def schedule_cost(
